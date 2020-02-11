@@ -59,13 +59,3 @@ evilprint (char *buf)
   ("movl %ebp, %esp\n" "pop %ebp\n" "movl $0x00000000, %eax\n" "jmp *%eax");
   */
 }
-
-
-void
-_init ()
-{
-}
-void
-_fini ()
-{
-}

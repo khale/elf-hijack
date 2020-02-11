@@ -1,5 +1,15 @@
-# ELF Hijacking Example
+# ELF Hijacking via PLT/GOT Poisoning
 
-This is some old code I salvaged for injecting code into 
-a target ELF binary. Perhaps I'll augment/extend it if I ever
-have some time.
+```
+$ make
+$ sudo make install
+$ ./daemon & 
+``
+
+Get PID of the `daemon` process, then invoke as follows:
+
+```
+$ sudo ./p01snr -p PID -f puts -l libtest.1.0.so -g
+```
+
+You should now see the daemon hijacked.
