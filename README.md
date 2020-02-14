@@ -2,13 +2,13 @@
 
 ## The Basics
 This PoC demonstrates how to infect a running process on a system in order to
-hide and later trigger code under an attacker's control. An attacker-controlled
-shared library is forced to be loaded into the target process, and function
-used by the process is redirected to point to a nefarious function living
-in the newly mapped shared library. The basic
+hide and later trigger code under an attacker's control. An attacker-controlled, parasitic
+shared library is forced to be loaded into the target process, and a function
+used normally by the process is redirected to point to a nefarious function living
+in the parasite library. The basic
 process is as follows:
 
-1. A library is built by the attacker (in our case `libtest.so.1.0`) that overrides a function which
+1. The parasite library is built by the attacker (in our case `libtest.so.1.0`) that overrides a function which
 is known to exist in the address space of the target process (and which
 is known to be used by the target program). For example, `printf` is a good
 bet, since it lives in `libc` and is pretty commonly used. Our example does
@@ -16,7 +16,7 @@ this using a function called `evilprint()`, which prints "I am evil." rather
 than the original `printf()` arguments.
 
 2. Once an attacker compromises a system (and gets privilege), this
-library is brought onto the compromised system, along with an attack tool.
+parasite library is brought onto the compromised system, along with an attack tool.
 
 3. The attack tool (in our case `p01snr`) is run (as root) and uses 
 `ptrace` to attach to the target process. This will *only* work 
@@ -25,7 +25,7 @@ as a root user.
 4. After attaching, the attack tool injects some shellcode into the target process's
 code segment (`.text`) (using `ptrace(POKE_TEXT)`). The purpose of this shellcode is
 to `open()` and subsequently `mmap()` the shared library into the target process's
-address space. Newer systems will prevent this code injection, in which case more
+address space. Newer systems will prevent this sort of code injection, in which case more
 clever use of `ptrace()` is necessary. See [countermeasures](#countermeasures) for
 more detail.
 
@@ -36,25 +36,25 @@ attacker's library is loaded into the target process (which can be verified
 by inspecting `/proc/<PID>/maps` of the target process). 
 
 6. Now that the library is loaded,  the attack tool overrides the original
-target function (`printf()`) with the attacker's function inside the library
+target function (`printf()`) with the attacker's function inside the parasite library
 (`evilprint()`). It does this by patching the GOT entry corresponding to the
 target function.  The attack tool can find the GOT by reading the memory image
 of the target process at the location where the target program's binary is
 mapped. This way it can parse the ELF binary and thus find the GOT location.
 The GOT entry for `printf()` is overridden with `evilprint()`, thus redirecting
-any future calls to the attacker's library. To make this work, the attacker
-needs to know the address of the overriding function in the library. One way to
+any future calls of the target function to the parasite library. To make this work, the attacker
+needs to know the address of the overriding function in the parasite library. One way to
 find this easily is to use a function signature (first few bytes of the object
 code) to do pattern matching of the library's binary. That's exactly what this
-PoC does. 
+PoC does. See `scripts/extract_func_sig.sh`.
 
 7. The previous will *completely* override the original target function. One
-behavior that might be beneficial is to instead do the same, but then after our
-overriding function is invoked, invoke the original target function. In our
-case, that would mean that `evilprint()` does what it needs to, it then invokes
+behavior that might be beneficial is to instead orverride it, but then after our
+overriding function is invoked, invoke the original target function as well. In our
+case, that would mean that `evilprint()` does what it needs to, then invokes
 `printf()`.  This gives us the ability to make it look to the program like
 nothing has changed. In order for this to occur, the overriding function cannot
-just directly invoke the original. Instead, the overriding function contains
+just directly invoke the original (think about why). Instead, the overriding function contains
 an obvious call via function pointer to a place-holder address. The attack tool
 will then play the role of the dynamic linker at runtime and patch this place-holder
 address with the address of the target function (`printf()`). It does this by
