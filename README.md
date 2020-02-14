@@ -24,7 +24,7 @@ as a root user.
 
 4. After attaching, the attack tool injects some shellcode into the target process's
 code segment (`.text`) (using `ptrace(POKE_TEXT)`). The purpose of this shellcode is
-to `open() and subsequently `mmap()` the shared library into the target process's
+to `open()` and subsequently `mmap()` the shared library into the target process's
 address space. Newer systems will prevent this code injection, in which case more
 clever use of `ptrace()` is necessary. See [countermeasures](#countermeasures) for
 more detail.
@@ -126,3 +126,6 @@ Note that we *must* run this command as root, otherwise the attack tool
 will not be able to `ptrace(PTRACE_ATTACH)` to the target process. 
 
 You should now see the daemon hijacked (evident from it printing "I am evil.").
+
+# Acknowledgements
+The PoC code here was originally (way back in 2013) taken from a great [article](https://vxjes.us/papers/Neill%20'Modern%20Day%20ELF%20Runtime%20infection%20via%20GOT%20poisoning.html#c11) by Ryan ([elfmaster](https://twitter.com/ryan_elfmaster)) O'Neill. I've since modified it and adapted it for a security class, and added some tools to autogenerate payloads. For more great ELF hackery I recommend perusing his [github](https://github.com/elfmaster).
