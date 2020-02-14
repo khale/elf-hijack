@@ -1,10 +1,13 @@
 # ELF Hijacking via PLT/GOT Poisoning
 
+# GRSEC patches
+
+# Usage
 ```
 $ make
 $ sudo make install
 $ ./daemon & 
-``
+```
 
 Get PID of the `daemon` process, then invoke as follows:
 
