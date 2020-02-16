@@ -1,0 +1,12 @@
+language: c
+
+dist: xenial
+
+addons:
+  apt:
+    update: true
+    packages:
+      - libc6-dev-i386
+      - binutils
+
+script: make
