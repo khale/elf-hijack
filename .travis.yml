@@ -11,6 +11,6 @@ addons:
       - make
       - gcc
       - build-essential
-      - linux-headers
+      - gcc-multilib
 
 script: make
