@@ -11,5 +11,6 @@ addons:
       - make
       - gcc
       - build-essential
+      - linux-headers
 
 script: make
