@@ -10,6 +10,6 @@ addons:
       - binutils
       - make
       - gcc
-      - build-essentials
+      - build-essential
 
 script: make
