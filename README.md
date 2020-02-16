@@ -1,4 +1,5 @@
 # ELF Hijacking via PLT/GOT Poisoning
+[![Build Status](https://travis-ci.org/khale/elf-hijack.svg?branch=master)](https://travis-ci.org/khale/elf-hijack)
 
 ## The Basics
 This PoC demonstrates how to infect a running process on a system in order to
