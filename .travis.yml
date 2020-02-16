@@ -8,5 +8,8 @@ addons:
     packages:
       - libc6-dev-i386
       - binutils
+      - make
+      - gcc
+      - build-essentials
 
 script: make
