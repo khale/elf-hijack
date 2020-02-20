@@ -120,7 +120,7 @@ track of it, you can find it later on with `ps aux | grep daemon`.
 Once we have the PID of the `daemon` process, we can attack it as follows:
 
 ```
-$ sudo ./p01snr -p PID -f puts -l libtest.1.0.so -g
+$ sudo ./p01snr -p PID -f puts -l libtest.so.1.0 -g
 ```
 
 Note that we *must* run this command as root, otherwise the attack tool
