@@ -30,5 +30,5 @@ echo -n "$(objdump -d $1 | \
 echo "\";"
 
 echo -n "static char const tc[] = \""
-echo -n "$(objdump -d $1 | grep -A 20 "$2>" | grep "c7 45" | cut -f 2 | sed -E 's/(\w{2})/\\x\1/g' | sed -E 's/\s+//g' | cut -c1-16)"
-echo "\";"
+echo -n "$(objdump -d $1 | grep -A 20 "$2>" | grep "c7 45 f4" | cut -f 2 | sed -E 's/(\w{2})/\\x\1/g' | tr '\n' '\ ' | sed -E 's/\s+//g' | cut -c1-16)"
+echo '";'
